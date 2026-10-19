@@ -122,6 +122,8 @@ func main() {
 	timeout := flag.Uint("timeout", 10, "connection timeout (seconds)")
 	dataTimeout := flag.Uint("datatimeout", 3600, "data transmission timeout (seconds)")
 	isVersion := flag.Bool("version", false, "display package version")
+	isWatch := flag.Bool("watch", false, "watch the local clipboard and sync continuously (client mode)")
+	watchInterval := flag.Duration("watch-interval", 700*time.Millisecond, "clipboard polling interval for -watch")
 
 	defaultConfigFile := "~/.piknik.toml"
 	if runtime.GOOS == "windows" {
@@ -248,8 +250,11 @@ func main() {
 	if *isPull {
 		modeCount++
 	}
+	if *isWatch {
+		modeCount++
+	}
 	if modeCount > 1 {
-		log.Fatal("Only one of -copy, -move, -push, -pull can be specified")
+		log.Fatal("Only one of -copy, -move, -push, -pull, -watch can be specified")
 	}
 
 	cid := *cidFlag
@@ -261,6 +266,15 @@ func main() {
 	}
 
 	confCheck(conf, *isServer)
+	if *isWatch {
+		if *isServer {
+			log.Fatal("-watch cannot be combined with -server")
+		}
+		if err := RunWatch(conf, *watchInterval); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if *isServer {
 		RunServer(conf)
 	} else {

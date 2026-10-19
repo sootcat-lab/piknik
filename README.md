@@ -1,3 +1,8 @@
+> **This is a fork.** It adds a `-watch` mode that mirrors the OS clipboard
+> automatically. See [README.fork.md](./README.fork.md).
+> Based on [jedisct1/piknik](https://github.com/jedisct1/piknik)
+> (Copyright (c) 2016-2026, Frank Denis). Not affiliated with the original author.
+
 [![Latest release](https://img.shields.io/github/release/jedisct1/piknik.svg)](https://github.com/jedisct1/piknik/releases/latest)
 [![Build status](https://travis-ci.com/jedisct1/piknik.svg?branch=master)](https://travis-ci.com/jedisct1/piknik?branch=master)
 ![CodeQL scan](https://github.com/jedisct1/piknik/workflows/Code%20scanning%20-%20action/badge.svg)
