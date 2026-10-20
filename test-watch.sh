@@ -48,7 +48,10 @@ wait_until(){ local deadline=$(( $(date +%s%N) + $1 * 1000000000 )); shift
   while [ "$(date +%s%N)" -lt "$deadline" ]; do eval "$*" && return 0; sleep 0.1; done; return 1; }
 
 stop_all(){
-  for p in $(pgrep -x "$(basename "$BIN")"); do kill "$p" 2>/dev/null; done
+  # 只杀本测试目录下的二进制，避免误杀 systemd 管理的 ~/.local/bin/piknik
+  for p in $(pgrep -x "$(basename "$BIN")"); do
+    [ "$(readlink -f "/proc/$p/exe" 2>/dev/null)" = "$BIN" ] && kill "$p" 2>/dev/null
+  done
   for p in $(pgrep -x wl-copy); do kill "$p" 2>/dev/null; done
   sleep 0.7
 }
