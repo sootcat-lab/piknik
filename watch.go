@@ -162,26 +162,39 @@ func (c *execClipboard) Set(data []byte) error {
 	return cmd.Run()
 }
 
-// powershellClipboard is a dependency-free Windows backend. It spawns a
-// PowerShell process on every poll, which is acceptable at 1s intervals but
-// can be replaced by a native clipboard library later.
+// powershellClipboard is a dependency-free Windows backend. It bypasses the
+// console code page by reading and writing raw UTF-8 bytes on the standard
+// streams, so non-ASCII clipboard text (e.g. Chinese) is not mangled.
 type powershellClipboard struct{}
 
 func (c *powershellClipboard) Get() ([]byte, error) {
+	const script = `$ErrorActionPreference = 'Stop'
+$t = Get-Clipboard -Raw
+if ($null -eq $t) { $t = '' }
+$b = [System.Text.Encoding]::UTF8.GetBytes($t)
+$o = [Console]::OpenStandardOutput()
+$o.Write($b, 0, $b.Length)
+$o.Flush()`
 	out, err := exec.Command(
 		"powershell", "-NoProfile", "-NonInteractive",
-		"-Command", "Get-Clipboard -Raw",
+		"-Command", script,
 	).Output()
 	if err != nil {
 		return nil, err
 	}
-	return bytes.TrimSuffix(out, []byte("\r\n")), nil
+	return out, nil
 }
 
 func (c *powershellClipboard) Set(data []byte) error {
+	const script = `$ErrorActionPreference = 'Stop'
+$i = [Console]::OpenStandardInput()
+$ms = New-Object System.IO.MemoryStream
+$i.CopyTo($ms)
+$t = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+Set-Clipboard -Value $t`
 	cmd := exec.Command(
 		"powershell", "-NoProfile", "-NonInteractive",
-		"-Command", "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+		"-Command", script,
 	)
 	cmd.Stdin = bytes.NewReader(data)
 	return cmd.Run()
