@@ -16,29 +16,61 @@ sponsored by the original author.
 - **`-watch` mode** — poll the local clipboard, push changes to the staging
   server, and apply remote changes locally.
 - **`-watch-interval`** — polling interval (default `700ms`).
+- **`-watch-images`** — also sync clipboard images (see [Images](#images)).
 - **Clipboard backends**:
   - Linux / Wayland: `wl-paste`, `wl-copy`
   - Linux / X11: `xclip`
   - Windows: PowerShell `Get-Clipboard` / `Set-Clipboard`
   - macOS: `pbpaste` / `pbcopy`
-- **Echo suppression** — content received from the server is not pushed back,
-  with trailing line endings normalized to avoid loops.
+- **Echo suppression** — content this client pushed is never applied back to it,
+  and content applied from the server is never pushed back. Recently synced
+  values are tracked as a set (not a single "last value"), so peers bouncing
+  several values in a row cannot cause a loop.
+- **Binary firewall** — remote content that is not valid UTF-8 text, or not a
+  well-formed image envelope, is dropped instead of being written to the
+  clipboard. A peer that truncates binary at its first NUL byte can no longer
+  clobber your clipboard.
 - **Refactor** — copy/paste operations now accept `io.Reader`/`io.Writer` and
   return errors (`runClientIO`), so they can be driven from the watch loop.
   The wire protocol and crypto are unchanged.
 
 ## Platform support
 
-| Platform | Automatic sync | Notes |
-| --- | --- | --- |
-| Linux (Wayland) | Yes | needs `wl-clipboard` |
-| Linux (X11) | Yes | needs `xclip` |
-| Windows | Yes | uses PowerShell |
-| macOS | Yes | `pbpaste` / `pbcopy` |
+| Platform | Text sync | Image sync | Notes |
+| --- | --- | --- | --- |
+| Linux (Wayland) | Yes | Yes | needs `wl-clipboard` |
+| Linux (X11) | Yes | Yes | needs `xclip` |
+| Windows | Yes | Yes | uses PowerShell + WinForms |
+| macOS | Yes | No | `pbpaste` / `pbcopy` are text only |
 | Android | No (manual) | Termux + `termux-api`; no watch backend |
 
 `-watch` is polling-based. Android background clipboard access is restricted by
 the OS, so the phone uses manual push/pull commands instead.
+
+## Images
+
+`-watch` syncs text only. Pass `-watch-images` to sync images too:
+
+```sh
+piknik -watch -watch-images
+```
+
+Images are sent as a single ASCII line so they survive the text-only channel
+and the protocol stays untouched:
+
+```
+PiknikImage1 image/png iVBORw0KGgoAAAANSUhEUg...
+```
+
+A client that does not understand this envelope, or that runs without
+`-watch-images`, ignores it and leaves its clipboard alone. The MIME type is
+re-derived from the image bytes on receipt, so a tampered or truncated payload
+is rejected rather than pasted.
+
+Limits worth knowing: the staging server stores one value and `wl-copy` sizes
+are unbounded here, but large screenshots (multi-MB PNGs) are base64-inflated by
+~33% on the wire. Keep `-watch-interval` at its default when pasting big images,
+so the initial read is not racing the next poll.
 
 ## Build
 
@@ -191,7 +223,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/piknik -watch -watch-interval 700ms -config %h/.piknik.toml
+ExecStart=%h/.local/bin/piknik -watch -watch-images -watch-interval 700ms -config %h/.piknik.toml
 Restart=always
 RestartSec=3
 

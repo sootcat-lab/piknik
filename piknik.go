@@ -124,6 +124,7 @@ func main() {
 	isVersion := flag.Bool("version", false, "display package version")
 	isWatch := flag.Bool("watch", false, "watch the local clipboard and sync continuously (client mode)")
 	watchInterval := flag.Duration("watch-interval", 700*time.Millisecond, "clipboard polling interval for -watch")
+	watchImages := flag.Bool("watch-images", false, "also sync clipboard images in -watch mode (base64 over the text channel)")
 
 	defaultConfigFile := "~/.piknik.toml"
 	if runtime.GOOS == "windows" {
@@ -270,7 +271,7 @@ func main() {
 		if *isServer {
 			log.Fatal("-watch cannot be combined with -server")
 		}
-		if err := RunWatch(conf, *watchInterval); err != nil {
+		if err := RunWatch(conf, *watchInterval, *watchImages); err != nil {
 			log.Fatal(err)
 		}
 		return
