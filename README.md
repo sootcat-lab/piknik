@@ -71,9 +71,12 @@ How `-watch` notices local changes:
 - macOS: the clipboard is read every tick.
 
 The server is polled every `-watch-interval` after a change, backing off to
-four times the interval while nothing changes. Each poll downloads the full
-value (the protocol has no "unchanged" reply), so idle image sync still costs
-bandwidth.
+four times the interval while nothing changes. The server sends the
+content's signature ahead of the content, so a poll that finds the same
+signature as last time hangs up instead of downloading the value again; idle
+image sync costs little bandwidth. Servers built from this fork do not log
+those hang-ups; upstream servers log a `broken pipe` or `connection reset`
+line for each one.
 
 Android background clipboard access is restricted by the OS, so the phone uses
 the manual push/pull commands instead.

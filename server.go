@@ -5,11 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ed25519"
@@ -108,7 +110,10 @@ func (cnx *ClientConnection) getOperation(h1 []byte, isMove bool) {
 			}
 			storedContent.Unlock()
 		}
-		log.Print(err)
+		// A watching client hangs up once it sees the content is unchanged.
+		if !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ECONNRESET) {
+			log.Print(err)
+		}
 		return
 	}
 }
