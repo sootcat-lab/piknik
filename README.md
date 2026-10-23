@@ -3,12 +3,14 @@
 ![Piknik](./piknik.png)
 
 > Fork of [jedisct1/piknik](https://github.com/jedisct1/piknik) that adds
-> **automatic clipboard sync** between Linux, Windows, macOS and Android
-> (Termux), relayed through a server you control.
+> **automatic clipboard sync** between Linux, Windows and macOS (manual
+> push/pull on Android via Termux), relayed through a server you control.
 
 Upstream piknik is deliberately manual: you push with `pkc`, pull with `pkp`.
-This fork keeps the wire protocol, the crypto and the server untouched, and
-adds a `-watch` mode that mirrors the OS clipboard in both directions.
+This fork keeps the wire protocol and the crypto untouched, and adds a
+`-watch` mode that mirrors the OS clipboard in both directions. Fork and
+upstream clients and servers interoperate; the only server change is quieter
+logging.
 
 This is an independent fork. It is **not** affiliated with, endorsed by, or
 sponsored by the original author.
@@ -21,9 +23,14 @@ sponsored by the original author.
 - **`-watch-images`** — opt-in clipboard image sync (see [Images](#images)).
 - **Clipboard backends**:
   - Linux / Wayland: `wl-paste`, `wl-copy`
-  - Linux / X11: `xclip`
-  - Windows: PowerShell `Get-Clipboard` / `Set-Clipboard`
+  - Linux / X11: `xclip` (plus `clipnotify`, optional)
+  - Windows: PowerShell `Get-Clipboard` / `Set-Clipboard`, Win32 for change
+    detection
   - macOS: `pbpaste` / `pbcopy`
+- **Low idle cost** — the local clipboard is read only when it changes (where
+  the platform can tell), the server is polled with backoff, and unchanged
+  server content is not downloaded again. See
+  [How `-watch` works](#how--watch-works).
 - **Echo suppression** — the watcher remembers the last value on each side
   (local clipboard and server). A local change is pushed only if the server
   does not already hold it, and a server change is applied only if the
@@ -45,21 +52,29 @@ sponsored by the original author.
 - **Windows encoding fix** — clipboard text is read and written as raw UTF-8
   bytes through the standard streams, so non-ASCII text is no longer mangled by
   a GBK/CP936 console code page.
-- **Refactor** — copy/paste operations now accept `io.Reader`/`io.Writer` and
-  return errors (`runClientIO`), so they can be driven from the watch loop.
-  The wire protocol and the crypto are unchanged.
+- **Refactor** — the client handshake is split out (`dialClient`), and
+  copy/paste accept `io.Reader`/`io.Writer` and return errors instead of
+  exiting, so they can be driven from the watch loop.
 
 ## Platform support
 
 | Platform | Text sync | Image sync | Notes |
 | --- | --- | --- | --- |
 | Linux (Wayland) | Yes | Yes | needs `wl-clipboard` |
-| Linux (X11) | Yes | Yes | needs `xclip` |
-| Windows | Yes | Yes | PowerShell + WinForms |
+| Linux (X11) | Yes | Yes | needs `xclip`; `clipnotify` recommended |
+| Windows | Yes | Yes | PowerShell + WinForms, nothing to install |
 | macOS | Yes | No | `pbpaste` / `pbcopy` are text only |
 | Android (Termux) | Manual | — | `termux-api`; no watch backend |
 
-How `-watch` notices local changes:
+Android background clipboard access is restricted by the OS, so the phone uses
+the manual push/pull commands instead (see [Android](#5-android-termux)).
+
+## How `-watch` works
+
+Each tick (`-watch-interval`, default `700ms`) the watcher pushes a local
+change, if any, then polls the server when a poll is due.
+
+Local changes are noticed by:
 
 - Wayland: `wl-paste --watch`, so the clipboard is only read when it changes.
   This needs a compositor with a data-control protocol (KDE, wlroots-based
@@ -70,16 +85,19 @@ How `-watch` notices local changes:
   otherwise the clipboard is read every tick.
 - macOS: the clipboard is read every tick.
 
-The server is polled every `-watch-interval` after a change, backing off to
-four times the interval while nothing changes. The server sends the
-content's signature ahead of the content, so a poll that finds the same
-signature as last time hangs up instead of downloading the value again; idle
-image sync costs little bandwidth. Servers built from this fork do not log
-those hang-ups; upstream servers log a `broken pipe` or `connection reset`
-line for each one.
+The server is polled every tick after a change, backing off to four times the
+interval while nothing changes. The server sends the content's signature
+ahead of the content, so a poll that finds the signature of what this client
+last pushed or pulled hangs up instead of downloading the value again. With a
+5.9 MB screenshot on the server, idle traffic is about 30 KB/s instead of
+about 2.3 MB/s. Servers built from this fork do not log those hang-ups;
+upstream servers log a `broken pipe` or `connection reset` line for each one.
 
-Android background clipboard access is restricted by the OS, so the phone uses
-the manual push/pull commands instead.
+A value is pushed when the local clipboard changes to something the server
+does not hold, and applied when the server changes to something the local
+clipboard does not hold. At startup the current clipboard is recorded but
+not pushed, so restarting a watcher never overwrites newer content; a copy
+made while the watcher was stopped is not synced.
 
 ## Images
 
@@ -102,9 +120,10 @@ re-derived from the image bytes on receipt, so a tampered or truncated payload
 is rejected rather than pasted.
 
 Limits worth knowing: the staging server stores one value, and large
-screenshots (multi-MB PNGs) are base64-inflated by ~33% on the wire. Keep
-`-watch-interval` at its default when pasting big images, so the initial read is
-not racing the next poll.
+screenshots (multi-MB PNGs) are base64-inflated by ~33% on the wire. Windows
+re-encodes images it puts on the clipboard, so an image applied there is not
+byte-identical to the original; the watcher reads it back and does not push
+it again.
 
 ## Build
 
@@ -238,7 +257,7 @@ EncryptSk = "2f530eb85e59c1977fce726df9f87345206f2a3d40bf91f9e0e9eeec2c59a3e4"
 | `-push` / `-pull` | | stream stdin to pullers / receive one stream |
 | `-cid` | | label binding a push to its pullers |
 | `-watch` | | continuously mirror the local clipboard |
-| `-watch-interval` | `700ms` | clipboard polling interval |
+| `-watch-interval` | `700ms` | base interval for clipboard and server checks |
 | `-watch-images` | `false` | also sync clipboard images |
 | `-server` | | run the staging server |
 | `-genkeys` | | generate a key set |
@@ -309,7 +328,22 @@ accepted), or when it is over `-maxclients`. In practice:
    that port: a wrong `Psk` produces the exact same client error.
 
 Note that `piknik -watch` logs and keeps retrying, so a silently rejected
-server connection shows up as "nothing syncs" rather than an error dialog.
+server connection shows up as "nothing syncs" rather than an error dialog. A
+repeated error is logged once, until it changes or the connection recovers.
+
+**Is the new binary running?** `piknik -version` is the same across fork
+builds, so compare the hash of the running executable with the one you built:
+
+```sh
+sha256sum /proc/$(pgrep -x piknik)/exe            # Linux
+```
+
+```powershell
+Get-Process piknik | % { $_.Path; (Get-FileHash $_.Path).Hash }   # Windows
+```
+
+On Windows a running `piknik.exe` is locked: download the new build under
+another name, stop every `piknik` process, then move it into place.
 
 ## Security
 
@@ -321,16 +355,43 @@ server connection shows up as "nothing syncs" rather than an error dialog.
 - Keep configuration files at mode `600`.
 - In `-watch` mode everything you copy reaches every peer sharing the keys,
   except content marked by a password manager (not detected on macOS).
+- Conversely, any device holding the keys can write to your clipboard
+  without you doing anything. Only share the keys between your own devices.
 
 ## Limitations
 
-- The server is polled, not pushed to; see [Platform support](#platform-support).
-- Single clipboard slot: no history. Concurrent copies on two devices race.
+- The server is polled, not pushed to; see [How `-watch` works](#how--watch-works).
+- X11 without `clipnotify`, and macOS, read the clipboard on every tick.
+- On GNOME (no data-control protocol), Wayland falls back to reading the
+  clipboard every tick.
+- Single clipboard slot: no history. Concurrent copies on two devices race;
+  the last push wins.
 - macOS image sync is not implemented (`pbpaste` / `pbcopy` are text only), and
   macOS cannot see password manager markers: secrets copied there are synced.
 - Android is manual push/pull only.
 - Streaming (`-push` / `-pull`) still uses `os.Stdin` / `os.Stdout`; only
   copy/paste were refactored for the watch loop.
+
+## Development
+
+```sh
+go test -race ./...        # sync logic, decoding, and a real server round trip
+./test-watch.sh            # end-to-end on Wayland (needs wl-clipboard, python3-pillow)
+```
+
+`test-watch.sh` runs its own server on `127.0.0.1:8077` but uses your real
+clipboard. **Stop any running watcher first** (`systemctl --user stop
+piknik-watch`), or it will push the test data to your real server.
+
+Layout of the fork's code:
+
+| File | Contents |
+| --- | --- |
+| `watch.go` | watch loop, sync state, image envelope |
+| `clipboard.go`, `clipboard_changes.go` | backend interface, change notifiers |
+| `clipboard_wayland.go`, `clipboard_xclip.go`, `clipboard_pbpaste.go`, `clipboard_powershell.go` | backends |
+| `win32_windows.go` | clipboard sequence number and secret markers (Win32) |
+| `watch_test.go`, `test-watch.sh` | tests |
 
 ## Upstream and license
 
