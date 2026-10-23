@@ -15,19 +15,25 @@ sponsored by the original author.
 
 ## What this fork adds
 
-- **`-watch` mode** — poll the local clipboard, push changes to the staging
+- **`-watch` mode** — watch the local clipboard, push changes to the staging
   server, and apply remote changes locally, without any command being typed.
-- **`-watch-interval`** — polling interval (default `700ms`).
+- **`-watch-interval`** — base polling interval (default `700ms`).
 - **`-watch-images`** — opt-in clipboard image sync (see [Images](#images)).
 - **Clipboard backends**:
   - Linux / Wayland: `wl-paste`, `wl-copy`
   - Linux / X11: `xclip`
   - Windows: PowerShell `Get-Clipboard` / `Set-Clipboard`
   - macOS: `pbpaste` / `pbcopy`
-- **Echo suppression** — content this client pushed is never applied back to
-  it, and content applied from the server is never pushed back. Recently synced
-  values are tracked as a TTL- and size-bounded set (not a single "last value"),
-  so peers bouncing several values in a row cannot cause a loop.
+- **Echo suppression** — the watcher remembers the last value on each side
+  (local clipboard and server). A local change is pushed only if the server
+  does not already hold it, and a server change is applied only if the
+  clipboard does not already hold it, so nothing loops back, while copying a
+  value again (A → B → A) still syncs.
+- **Remote wins at startup** — starting the watcher never pushes whatever
+  happens to be on the local clipboard; it picks up the server value instead.
+- **Password managers respected** — content marked as secret is never pushed:
+  `x-kde-passwordManagerHint` on Wayland/X11 (KeePassXC and others), and
+  `ExcludeClipboardContentFromMonitorProcessing` on Windows.
 - **Text-only by default, binary firewall** — unless image sync is enabled, the
   watched clipboard is only read when it holds valid UTF-8 text, and remote
   content that is neither valid UTF-8 text nor a well-formed image envelope is
@@ -50,8 +56,21 @@ sponsored by the original author.
 | macOS | Yes | No | `pbpaste` / `pbcopy` are text only |
 | Android (Termux) | Manual | — | `termux-api`; no watch backend |
 
-`-watch` is polling-based. Android background clipboard access is restricted by
-the OS, so the phone uses the manual push/pull commands instead.
+How `-watch` notices local changes:
+
+- Wayland: `wl-paste --watch`, so the clipboard is only read when it changes.
+  This needs a compositor with a data-control protocol (KDE, wlroots-based
+  ones); elsewhere, GNOME included, it falls back to reading every tick.
+- Windows: the clipboard sequence number; PowerShell only runs on a change.
+- X11 and macOS: the clipboard is read every tick.
+
+The server is polled every `-watch-interval` after a change, backing off to
+four times the interval while nothing changes. Each poll downloads the full
+value (the protocol has no "unchanged" reply), so idle image sync still costs
+bandwidth.
+
+Android background clipboard access is restricted by the OS, so the phone uses
+the manual push/pull commands instead.
 
 ## Images
 
@@ -291,14 +310,15 @@ server connection shows up as "nothing syncs" rather than an error dialog.
 - A public staging port is therefore acceptable, but restricting it to your
   known source IPs is still recommended.
 - Keep configuration files at mode `600`.
+- In `-watch` mode everything you copy reaches every peer sharing the keys,
+  except content marked by a password manager (not detected on macOS).
 
 ## Limitations
 
-- Polling, not event-driven.
+- The server is polled, not pushed to; see [Platform support](#platform-support).
 - Single clipboard slot: no history. Concurrent copies on two devices race.
-- Windows spawns PowerShell on every poll; replace with a native clipboard
-  library if wakeups matter.
-- macOS image sync is not implemented (`pbpaste` / `pbcopy` are text only).
+- macOS image sync is not implemented (`pbpaste` / `pbcopy` are text only), and
+  macOS cannot see password manager markers: secrets copied there are synced.
 - Android is manual push/pull only.
 - Streaming (`-push` / `-pull`) still uses `os.Stdin` / `os.Stdout`; only
   copy/paste were refactored for the watch loop.

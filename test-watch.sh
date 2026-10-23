@@ -64,7 +64,7 @@ begin_case(){ # $1 = 标签, $2 = 额外 flags
   sleep 1
   base="base-$1-$RUN"
   printf '%s' "$base" | wl-copy
-  "$BIN" -config "$DIR/client.toml" -copy <<<"$base"   # 服务器基线（带换行）
+  printf '%s' "$base" | "$BIN" -config "$DIR/client.toml" -copy   # 服务器基线，与剪贴板逐字节相同
   sleep 0.5
   : >"$LOG"
   "$BIN" -watch -watch-interval 200ms -config "$DIR/client.toml" $2 >>"$LOG" 2>&1 &

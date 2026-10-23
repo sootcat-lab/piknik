@@ -11,7 +11,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -25,10 +25,12 @@ const (
 )
 
 // clipItem is one clipboard value: text, or an image with its media type.
+// A sensitive item was marked by a password manager; its data is not read.
 type clipItem struct {
-	kind clipKind
-	mime string
-	data []byte
+	kind      clipKind
+	mime      string
+	data      []byte
+	sensitive bool
 }
 
 // Images travel over the unmodified piknik protocol as a single line of ASCII
@@ -43,19 +45,16 @@ const imageEnvelopePrefix = "PiknikImage1 "
 // imageMimes is the order in which clipboard image flavours are preferred.
 var imageMimes = []string{"image/png", "image/jpeg", "image/webp", "image/gif"}
 
+// passwordManagerHint is the MIME type KeePassXC and others add to secrets
+// they put on the clipboard, asking clipboard managers not to record them.
+const passwordManagerHint = "x-kde-passwordManagerHint"
+
 // RunWatch continuously mirrors the local clipboard to the Piknik staging
 // server and applies remote changes locally.
 //
-// It relies on runClientIO(), which is the error-returning variant of
-// RunClient() added by the patch in PATCH.md.
-//
-// Two rules keep the sync from looping or corrupting the local clipboard:
-//   - content this client pushed is never applied back to it;
-//   - content applied from the server is never pushed back.
-//
-// Non-text content is ignored unless images are enabled, and remote data that
-// is neither valid UTF-8 text nor a well-formed image envelope is dropped, so
-// a peer that mangles binary cannot overwrite the local clipboard.
+// The server is polled with a backoff: every interval after a change, up to
+// four times the interval while nothing changes. The local clipboard is only
+// read when the backend reports a possible change.
 func RunWatch(conf Conf, interval time.Duration, syncImages bool) error {
 	if interval <= 0 {
 		interval = 700 * time.Millisecond
@@ -64,62 +63,163 @@ func RunWatch(conf Conf, interval time.Duration, syncImages bool) error {
 	if err != nil {
 		return err
 	}
+	w := &watcher{
+		clip:   clip,
+		images: syncImages,
+		push:   func(data []byte) error { return pushClip(conf, data) },
+		pull:   func() ([]byte, error) { return pullClip(conf) },
+	}
+	w.init()
 
-	// Content recently pushed or applied. A plain single "last value" cannot
-	// track this: peers bounce several values back within a few ticks.
-	synced := newSyncHistory(2*time.Minute, 64)
-	ignored := newSyncHistory(10*time.Minute, 16)
+	maxPullDelay := 4 * interval
+	pullDelay := interval
+	nextPull := time.Now()
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
-		local, err := clip.Get()
-		if err != nil {
-			log.Printf("watch: read clipboard failed: %v", err)
-		} else if local != nil && !synced.has(local) {
-			if err := pushClip(conf, local.encode()); err != nil {
-				log.Printf("watch: push failed: %v", err)
+		if w.syncLocal() {
+			pullDelay = interval
+		}
+		if now := time.Now(); !now.Before(nextPull) {
+			if w.syncRemote() {
+				pullDelay = interval
 			} else {
-				synced.add(local)
-				log.Printf("watch: pushed %d bytes (%s)", len(local.data), local.kind)
+				pullDelay = min(2*pullDelay, maxPullDelay)
 			}
+			nextPull = now.Add(pullDelay)
 		}
-
-		remote, err := pullClip(conf)
-		switch {
-		case err != nil:
-			if !isBenignPullError(err) {
-				log.Printf("watch: pull failed: %v", err)
-			}
-		case len(remote) > 0:
-			item := decodeItem(remote, syncImages)
-			switch {
-			case item == nil:
-				// Not text and not an image envelope: a peer mangled
-				// binary, or sent something this build cannot use.
-				if !ignored.has(&clipItem{data: remote}) {
-					ignored.add(&clipItem{data: remote})
-					log.Printf("watch: ignored %d bytes that are not text or a usable image", len(remote))
-				}
-			case synced.has(item):
-				// Our own push coming back, or content already applied.
-			default:
-				if cur, err := clip.Get(); err == nil && cur != nil && cur.equal(item) {
-					synced.add(item)
-					break
-				}
-				if err := clip.Set(item); err != nil {
-					log.Printf("watch: set clipboard failed: %v", err)
-				} else {
-					synced.add(item)
-					log.Printf("watch: applied %d bytes (%s)", len(item.data), item.kind)
-				}
-			}
-		}
-
 		<-ticker.C
 	}
+}
+
+// watcher holds the sync state. Content is compared by the hash of its wire
+// encoding, so local and remote values can be compared directly.
+//
+// A value is pushed when the local clipboard changes to something the server
+// does not already hold, and applied when the server changes to something the
+// local clipboard does not already hold. Comparing against the last value on
+// each side, rather than a history of seen values, keeps echoes out while
+// still syncing a value that was copied before.
+type watcher struct {
+	clip   clipboardAdapter
+	images bool
+	push   func([]byte) error
+	pull   func() ([]byte, error)
+
+	localHash  [sha256.Size]byte // last value seen on, or written to, the local clipboard
+	remoteHash [sha256.Size]byte // last value seen on, or pushed to, the server
+	pending    *clipItem         // local change not pushed yet
+
+	lastPushErr, lastPullErr string // logged once until the error changes
+}
+
+// logOnce logs err unless it repeats the previous error stored in *last.
+func logOnce(last *string, format string, err error) {
+	if msg := err.Error(); msg != *last {
+		*last = msg
+		log.Printf(format, err)
+	}
+}
+
+// sensitiveHash stands for "a password manager secret is on the clipboard".
+var sensitiveHash = sha256.Sum256([]byte("piknik: sensitive clipboard content"))
+
+// init records the current clipboard without pushing it, so that starting
+// the watcher never overwrites newer content on the server.
+func (w *watcher) init() {
+	w.clip.Changed()
+	if item, err := w.clip.Get(); err == nil && item != nil && !item.sensitive {
+		w.localHash = sha256.Sum256(item.encode())
+	}
+}
+
+// syncLocal pushes a local change, if any. It reports whether it pushed.
+func (w *watcher) syncLocal() bool {
+	if w.clip.Changed() {
+		item, err := w.clip.Get()
+		switch {
+		case err != nil:
+			log.Printf("watch: read clipboard failed: %v", err)
+		case item == nil:
+			w.localHash = [sha256.Size]byte{}
+			w.pending = nil
+		case item.sensitive:
+			if w.localHash != sensitiveHash {
+				log.Printf("watch: skipped content marked as sensitive by a password manager")
+			}
+			w.localHash = sensitiveHash
+			w.pending = nil
+		default:
+			if h := sha256.Sum256(item.encode()); h != w.localHash {
+				w.localHash = h
+				w.pending = nil
+				if h != w.remoteHash {
+					w.pending = item
+				}
+			}
+		}
+	}
+	if w.pending == nil {
+		return false
+	}
+	data := w.pending.encode()
+	if err := w.push(data); err != nil {
+		logOnce(&w.lastPushErr, "watch: push failed: %v", err)
+		return false
+	}
+	w.lastPushErr = ""
+	w.remoteHash = sha256.Sum256(data)
+	log.Printf("watch: pushed %d bytes (%s)", len(w.pending.data), w.pending.kind)
+	w.pending = nil
+	return true
+}
+
+// syncRemote applies a remote change, if any. It reports whether the server
+// content changed.
+func (w *watcher) syncRemote() bool {
+	raw, err := w.pull()
+	if err != nil {
+		if errors.Is(err, errClipboardEmpty) || errors.Is(err, errClipboardTooOld) {
+			w.lastPullErr = ""
+		} else {
+			logOnce(&w.lastPullErr, "watch: pull failed: %v", err)
+		}
+		return false
+	}
+	w.lastPullErr = ""
+	h := sha256.Sum256(raw)
+	if len(raw) == 0 || h == w.remoteHash {
+		return false
+	}
+	w.remoteHash = h
+	item := decodeItem(raw, w.images)
+	switch {
+	case item == nil:
+		// Not text and not an image envelope: a peer mangled binary, or
+		// sent something this build cannot use.
+		log.Printf("watch: ignored %d bytes that are not text or a usable image", len(raw))
+		return true
+	case h == w.localHash, w.pending != nil:
+		// Already on the clipboard, or a newer local value is waiting to
+		// be pushed.
+		return true
+	}
+	if err := w.clip.Set(item); err != nil {
+		log.Printf("watch: set clipboard failed: %v", err)
+		w.remoteHash = [sha256.Size]byte{} // retry on the next pull
+		return true
+	}
+	log.Printf("watch: applied %d bytes (%s)", len(item.data), item.kind)
+	// Read the value back: the platform may normalize it (Windows re-encodes
+	// images, for example), and that must not count as a local change.
+	w.clip.Changed()
+	w.localHash = h
+	if cur, err := w.clip.Get(); err == nil && cur != nil && !cur.sensitive {
+		w.localHash = sha256.Sum256(cur.encode())
+	}
+	return true
 }
 
 // pushClip uploads data using the existing copy operation.
@@ -132,12 +232,6 @@ func pullClip(conf Conf) ([]byte, error) {
 	var out bytes.Buffer
 	err := runClientIO(conf, false, false, false, false, "", nil, &out)
 	return out.Bytes(), err
-}
-
-// isBenignPullError reports errors that simply mean "nothing to paste".
-func isBenignPullError(err error) bool {
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "empty") || strings.Contains(s, "too old")
 }
 
 // ---------------------------------------------------------------------------
@@ -157,10 +251,6 @@ func (item *clipItem) encode() []byte {
 	}
 	return []byte(imageEnvelopePrefix + item.mime + " " +
 		base64.StdEncoding.EncodeToString(item.data))
-}
-
-func (item *clipItem) equal(other *clipItem) bool {
-	return item.kind == other.kind && item.mime == other.mime && bytes.Equal(item.data, other.data)
 }
 
 // decodeItem parses clipboard content coming from the server. It returns nil
@@ -212,60 +302,6 @@ func sniffImageMime(data []byte) string {
 	return ""
 }
 
-// syncHistory is a small TTL+size bounded set of content hashes.
-type syncHistory struct {
-	mu      sync.Mutex
-	ttl     time.Duration
-	max     int
-	entries map[[sha256.Size]byte]time.Time
-}
-
-func newSyncHistory(ttl time.Duration, max int) *syncHistory {
-	return &syncHistory{ttl: ttl, max: max, entries: make(map[[sha256.Size]byte]time.Time)}
-}
-
-func (h *syncHistory) has(item *clipItem) bool {
-	key := item.hash()
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	seenAt, ok := h.entries[key]
-	if !ok {
-		return false
-	}
-	if time.Since(seenAt) > h.ttl {
-		delete(h.entries, key)
-		return false
-	}
-	return true
-}
-
-func (h *syncHistory) add(item *clipItem) {
-	key := item.hash()
-	now := time.Now()
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.entries[key] = now
-	if len(h.entries) <= h.max {
-		return
-	}
-	for k, seenAt := range h.entries {
-		if now.Sub(seenAt) > h.ttl || len(h.entries) > h.max {
-			delete(h.entries, k)
-		}
-	}
-}
-
-func (item *clipItem) hash() [sha256.Size]byte {
-	h := sha256.New()
-	h.Write([]byte{byte(item.kind)})
-	h.Write([]byte(item.mime))
-	h.Write([]byte{0})
-	h.Write(item.data)
-	var sum [sha256.Size]byte
-	copy(sum[:], h.Sum(nil))
-	return sum
-}
-
 // ---------------------------------------------------------------------------
 // Clipboard backends
 // ---------------------------------------------------------------------------
@@ -274,6 +310,9 @@ type clipboardAdapter interface {
 	// Get returns the clipboard content, or nil when there is nothing usable.
 	Get() (*clipItem, error)
 	Set(item *clipItem) error
+	// Changed reports whether the clipboard may have changed since the
+	// last call. Backends that cannot tell always return true.
+	Changed() bool
 }
 
 func newClipboard(syncImages bool) (clipboardAdapter, error) {
@@ -287,7 +326,9 @@ func newClipboard(syncImages bool) (clipboardAdapter, error) {
 			if _, err := exec.LookPath("wl-paste"); err != nil {
 				return nil, fmt.Errorf("wl-paste not found: install wl-clipboard")
 			}
-			return &waylandClipboard{images: syncImages}, nil
+			c := &waylandClipboard{images: syncImages}
+			c.startWatch()
+			return c, nil
 		}
 		if _, err := exec.LookPath("xclip"); err != nil {
 			return nil, fmt.Errorf("no clipboard backend found: install wl-clipboard or xclip")
@@ -347,7 +388,43 @@ func runFeed(command string, data []byte, args ...string) error {
 
 // waylandClipboard uses wl-paste/wl-copy.
 type waylandClipboard struct {
-	images bool
+	images  bool
+	dirty   atomic.Bool // a change notification arrived
+	polling atomic.Bool // change notifications are unavailable
+}
+
+// startWatch runs "wl-paste --watch", which prints a line on every clipboard
+// change. Compositors without a data-control protocol (GNOME, for one) do not
+// support it; the backend then reads the clipboard on every tick.
+func (c *waylandClipboard) startWatch() {
+	c.dirty.Store(true)
+	cmd := exec.Command("wl-paste", "--watch", "echo")
+	cmd.SysProcAttr = childProcAttr() // do not outlive piknik
+	out, err := cmd.StdoutPipe()
+	if err == nil {
+		err = cmd.Start()
+	}
+	if err != nil {
+		log.Printf("watch: wl-paste --watch unavailable (%v), polling instead", err)
+		c.polling.Store(true)
+		return
+	}
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			if _, err := out.Read(buf); err != nil {
+				break
+			}
+			c.dirty.Store(true)
+		}
+		err := cmd.Wait()
+		log.Printf("watch: wl-paste --watch exited (%v), polling instead", err)
+		c.polling.Store(true)
+	}()
+}
+
+func (c *waylandClipboard) Changed() bool {
+	return c.polling.Load() || c.dirty.Swap(false)
 }
 
 func (c *waylandClipboard) types() []string {
@@ -376,6 +453,9 @@ func (c *waylandClipboard) Get() (*clipItem, error) {
 	types := c.types()
 	if len(types) == 0 {
 		return nil, nil
+	}
+	if hasType(types, passwordManagerHint) {
+		return &clipItem{sensitive: true}, nil
 	}
 	if t := pickTextType(types); t != "" {
 		if item, ok := plainTextItem(c.read(t)); ok {
@@ -407,13 +487,17 @@ func (c *waylandClipboard) Set(item *clipItem) error {
 	return runFeed("wl-copy", item.data)
 }
 
-// pbpasteClipboard is the macOS backend: pbcopy/pbpaste handle text only.
+// pbpasteClipboard is the macOS backend: pbcopy/pbpaste handle text only,
+// and cannot see the markers password managers set, so secrets are synced.
+// The clipboard is read on every tick.
 type pbpasteClipboard struct{}
+
+func (c *pbpasteClipboard) Changed() bool { return true }
 
 func (c *pbpasteClipboard) Get() (*clipItem, error) {
 	out, err := exec.Command("pbpaste").Output()
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	item, ok := plainTextItem(out)
 	if !ok {
@@ -429,10 +513,13 @@ func (c *pbpasteClipboard) Set(item *clipItem) error {
 	return runFeed("pbcopy", item.data)
 }
 
-// xclipClipboard is the X11 backend.
+// xclipClipboard is the X11 backend. xclip cannot wait for changes, so the
+// clipboard is read on every tick.
 type xclipClipboard struct {
 	images bool
 }
+
+func (c *xclipClipboard) Changed() bool { return true }
 
 func (c *xclipClipboard) targets() []string {
 	out, err := exec.Command("xclip", "-selection", "clipboard", "-t", "TARGETS", "-o").Output()
@@ -460,6 +547,9 @@ func (c *xclipClipboard) Get() (*clipItem, error) {
 	targets := c.targets()
 	if len(targets) == 0 {
 		return nil, nil
+	}
+	if hasType(targets, passwordManagerHint) {
+		return &clipItem{sensitive: true}, nil
 	}
 	if t := pickTextType(targets); t != "" {
 		if item, ok := plainTextItem(c.read(t)); ok {
@@ -495,12 +585,27 @@ func (c *xclipClipboard) Set(item *clipItem) error {
 // console code page by reading and writing raw UTF-8 bytes on the standard
 // streams, so non-ASCII clipboard text (e.g., Chinese) is not mangled. With
 // images enabled it goes through System.Windows.Forms.Clipboard and exchanges
-// PNG as base64.
+// PNG as base64. PowerShell is slow to start, so it only runs when the
+// clipboard sequence number changes.
 type powershellClipboard struct {
 	images bool
+	seq    uint32
+}
+
+func (c *powershellClipboard) Changed() bool {
+	seq := clipboardSeq()
+	if seq == 0 { // no access to the sequence number: always read
+		return true
+	}
+	changed := seq != c.seq
+	c.seq = seq
+	return changed
 }
 
 func (c *powershellClipboard) Get() (*clipItem, error) {
+	if clipboardSensitive() {
+		return &clipItem{sensitive: true}, nil
+	}
 	const textScript = `$ErrorActionPreference = 'Stop'
 $t = Get-Clipboard -Raw
 if ($null -eq $t) { $t = '' }

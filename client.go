@@ -24,6 +24,12 @@ import (
 const DefaultClientVersion = byte(7)
 
 // Client - Client data
+// Paste errors that only mean there is nothing to paste.
+var (
+	errClipboardEmpty  = errors.New("the clipboard might be empty")
+	errClipboardTooOld = errors.New("clipboard content is too old")
+)
+
 type Client struct {
 	conf    Conf
 	conn    net.Conn
@@ -108,7 +114,7 @@ func (client *Client) pasteOperation(h1 []byte, isMove bool, out io.Writer) erro
 	if nbread, err := io.ReadFull(reader, rbuf); err != nil {
 		if err == io.ErrUnexpectedEOF {
 			if nbread < 80 {
-				return errors.New("the clipboard might be empty")
+				return errClipboardEmpty
 			}
 			return errors.New("the server may be running an incompatible version")
 		}
@@ -132,7 +138,7 @@ func (client *Client) pasteOperation(h1 []byte, isMove bool, out io.Writer) erro
 		return errors.New("clipboard content timestamp is too far in the future")
 	}
 	if now.Sub(tsTime) >= conf.TTL {
-		return errors.New("clipboard content is too old")
+		return errClipboardTooOld
 	}
 	if ciphertextWithEncryptSkIDAndNonceLen < 8+24 {
 		return errors.New("clipboard content is too short")
