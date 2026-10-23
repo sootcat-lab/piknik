@@ -28,7 +28,16 @@ const DefaultClientVersion = byte(7)
 var (
 	errClipboardEmpty  = errors.New("the clipboard might be empty")
 	errClipboardTooOld = errors.New("clipboard content is too old")
+	// Returned instead of downloading content the caller already has.
+	errClipboardUnchanged = errors.New("clipboard content is unchanged")
 )
+
+// signatureFilter can be implemented by the writer passed to a paste. It is
+// shown the authenticated signature of the stored content before the content
+// is downloaded, and returns true to skip the download.
+type signatureFilter interface {
+	unchanged(signature []byte) bool
+}
 
 type Client struct {
 	conf    Conf
@@ -142,6 +151,9 @@ func (client *Client) pasteOperation(h1 []byte, isMove bool, out io.Writer) erro
 	}
 	if ciphertextWithEncryptSkIDAndNonceLen < 8+24 {
 		return errors.New("clipboard content is too short")
+	}
+	if f, ok := out.(signatureFilter); ok && f.unchanged(signature) {
+		return errClipboardUnchanged
 	}
 	ciphertextWithEncryptSkIDAndNonce := make([]byte, ciphertextWithEncryptSkIDAndNonceLen)
 	client.conn.SetDeadline(time.Now().Add(conf.DataTimeout))

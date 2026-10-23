@@ -67,7 +67,7 @@ func RunWatch(conf Conf, interval time.Duration, syncImages bool) error {
 		clip:   clip,
 		images: syncImages,
 		push:   func(data []byte) error { return pushClip(conf, data) },
-		pull:   func() ([]byte, error) { return pullClip(conf) },
+		pull:   (&puller{conf: conf}).pull,
 	}
 	w.init()
 
@@ -181,7 +181,7 @@ func (w *watcher) syncLocal() bool {
 func (w *watcher) syncRemote() bool {
 	raw, err := w.pull()
 	if err != nil {
-		if errors.Is(err, errClipboardEmpty) || errors.Is(err, errClipboardTooOld) {
+		if errors.Is(err, errClipboardUnchanged) || errors.Is(err, errClipboardEmpty) || errors.Is(err, errClipboardTooOld) {
 			w.lastPullErr = ""
 		} else {
 			logOnce(&w.lastPullErr, "watch: pull failed: %v", err)
@@ -227,11 +227,31 @@ func pushClip(conf Conf, data []byte) error {
 	return runClientIO(conf, true, false, false, false, "", bytes.NewReader(data), nil)
 }
 
-// pullClip downloads the current clipboard using the existing paste operation.
-func pullClip(conf Conf) ([]byte, error) {
-	var out bytes.Buffer
-	err := runClientIO(conf, false, false, false, false, "", nil, &out)
+// puller downloads the current clipboard using the existing paste operation.
+// The server sends the content's signature ahead of the content, so content
+// that still carries the last seen signature is not downloaded again.
+type puller struct {
+	conf    Conf
+	lastSig []byte
+}
+
+func (p *puller) pull() ([]byte, error) {
+	out := &pullBuffer{last: p.lastSig}
+	err := runClientIO(p.conf, false, false, false, false, "", nil, out)
+	if err == nil {
+		p.lastSig = out.sig
+	}
 	return out.Bytes(), err
+}
+
+type pullBuffer struct {
+	bytes.Buffer
+	last, sig []byte
+}
+
+func (b *pullBuffer) unchanged(signature []byte) bool {
+	b.sig = append([]byte(nil), signature...)
+	return bytes.Equal(signature, b.last)
 }
 
 // ---------------------------------------------------------------------------
