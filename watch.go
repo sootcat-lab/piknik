@@ -63,11 +63,12 @@ func RunWatch(conf Conf, interval time.Duration, syncImages bool) error {
 	if err != nil {
 		return err
 	}
+	srv := &remote{conf: conf}
 	w := &watcher{
 		clip:   clip,
 		images: syncImages,
-		push:   func(data []byte) error { return pushClip(conf, data) },
-		pull:   (&puller{conf: conf}).pull,
+		push:   srv.push,
+		pull:   srv.pull,
 	}
 	w.init()
 
@@ -222,36 +223,40 @@ func (w *watcher) syncRemote() bool {
 	return true
 }
 
-// pushClip uploads data using the existing copy operation.
-func pushClip(conf Conf, data []byte) error {
-	return runClientIO(conf, true, false, false, false, "", bytes.NewReader(data), nil)
+// remote pushes and pulls clipboard content with the copy and paste
+// operations. It remembers the signature of the content last pushed or
+// pulled, so that a pull does not download that content again.
+type remote struct {
+	conf      Conf
+	signature []byte
 }
 
-// puller downloads the current clipboard using the existing paste operation.
-// The server sends the content's signature ahead of the content, so content
-// that still carries the last seen signature is not downloaded again.
-type puller struct {
-	conf    Conf
-	lastSig []byte
-}
-
-func (p *puller) pull() ([]byte, error) {
-	out := &pullBuffer{last: p.lastSig}
-	err := runClientIO(p.conf, false, false, false, false, "", nil, out)
-	if err == nil {
-		p.lastSig = out.sig
+func (s *remote) push(data []byte) error {
+	client, h1, err := dialClient(s.conf, 6)
+	if err != nil {
+		return err
 	}
-	return out.Bytes(), err
+	defer client.conn.Close()
+	if err := client.copyOperation(h1, bytes.NewReader(data)); err != nil {
+		return err
+	}
+	s.signature = client.signature
+	return nil
 }
 
-type pullBuffer struct {
-	bytes.Buffer
-	last, sig []byte
-}
-
-func (b *pullBuffer) unchanged(signature []byte) bool {
-	b.sig = append([]byte(nil), signature...)
-	return bytes.Equal(signature, b.last)
+func (s *remote) pull() ([]byte, error) {
+	client, h1, err := dialClient(s.conf, 6)
+	if err != nil {
+		return nil, err
+	}
+	defer client.conn.Close()
+	client.knownSignature = s.signature
+	var out bytes.Buffer
+	if err := client.pasteOperation(h1, false, &out); err != nil {
+		return nil, err
+	}
+	s.signature = client.signature
+	return out.Bytes(), nil
 }
 
 // ---------------------------------------------------------------------------

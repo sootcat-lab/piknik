@@ -23,7 +23,6 @@ import (
 
 const DefaultClientVersion = byte(7)
 
-// Client - Client data
 // Paste errors that only mean there is nothing to paste.
 var (
 	errClipboardEmpty  = errors.New("the clipboard might be empty")
@@ -32,19 +31,21 @@ var (
 	errClipboardUnchanged = errors.New("clipboard content is unchanged")
 )
 
-// signatureFilter can be implemented by the writer passed to a paste. It is
-// shown the authenticated signature of the stored content before the content
-// is downloaded, and returns true to skip the download.
-type signatureFilter interface {
-	unchanged(signature []byte) bool
-}
-
+// Client - Client data
 type Client struct {
 	conf    Conf
 	conn    net.Conn
 	reader  *bufio.Reader
 	writer  *bufio.Writer
 	version byte
+
+	// knownSignature makes a paste return errClipboardUnchanged instead of
+	// downloading content with that signature. The server sends the
+	// signature, authenticated, ahead of the content.
+	knownSignature []byte
+	// signature is set to the signature of the content a copy stored or a
+	// paste fetched.
+	signature []byte
 }
 
 func (client *Client) copyOperation(h1 []byte, in io.Reader) error {
@@ -101,6 +102,7 @@ func (client *Client) copyOperation(h1 []byte, in io.Reader) error {
 	if subtle.ConstantTimeCompare(wh3, h3) != 1 {
 		return errors.New("incorrect authentication code")
 	}
+	client.signature = signature
 	if IsTerminal(int(syscall.Stderr)) {
 		os.Stderr.WriteString("Sent\n")
 	}
@@ -152,7 +154,7 @@ func (client *Client) pasteOperation(h1 []byte, isMove bool, out io.Writer) erro
 	if ciphertextWithEncryptSkIDAndNonceLen < 8+24 {
 		return errors.New("clipboard content is too short")
 	}
-	if f, ok := out.(signatureFilter); ok && f.unchanged(signature) {
+	if client.knownSignature != nil && bytes.Equal(signature, client.knownSignature) {
 		return errClipboardUnchanged
 	}
 	ciphertextWithEncryptSkIDAndNonce := make([]byte, ciphertextWithEncryptSkIDAndNonceLen)
@@ -180,6 +182,7 @@ func (client *Client) pasteOperation(h1 []byte, isMove bool, out io.Writer) erro
 	}
 	content := ciphertextWithEncryptSkIDAndNonce[32:]
 	cipher.XORKeyStream(content, content)
+	client.signature = append([]byte(nil), signature...)
 	return binary.Write(out, binary.LittleEndian, content)
 }
 
@@ -458,54 +461,16 @@ func RunClient(conf Conf, isCopy bool, isMove bool, isPush bool, isPull bool, ci
 }
 
 func runClientIO(conf Conf, isCopy bool, isMove bool, isPush bool, isPull bool, cid string, in io.Reader, out io.Writer) error {
-	conn, err := net.DialTimeout("tcp", conf.Connect, conf.Timeout)
-	if err != nil {
-		return fmt.Errorf("unable to connect to %v - is a Piknik server running on that host?", conf.Connect)
-	}
-	defer conn.Close()
-
 	clientVersion := byte(7)
 	if !isPush && !isPull {
 		clientVersion = byte(6)
 	}
+	client, h1, err := dialClient(conf, clientVersion)
+	if err != nil {
+		return err
+	}
+	defer client.conn.Close()
 
-	conn.SetDeadline(time.Now().Add(conf.Timeout))
-	reader, writer := bufio.NewReader(conn), bufio.NewWriter(conn)
-	client := Client{
-		conf:    conf,
-		conn:    conn,
-		reader:  reader,
-		writer:  writer,
-		version: clientVersion,
-	}
-	r := make([]byte, 32)
-	if _, err = rand.Read(r); err != nil {
-		return err
-	}
-	h0 := auth0(conf, client.version, r)
-	writer.Write([]byte{client.version})
-	writer.Write(r)
-	writer.Write(h0)
-	if err := writer.Flush(); err != nil {
-		return err
-	}
-	rbuf := make([]byte, 65)
-	if nbread, err := io.ReadFull(reader, rbuf); err != nil {
-		if nbread < 2 {
-			return errors.New("the server rejected the connection - check that it is running the same Piknik version or retry later")
-		}
-		return errors.New("the server doesn't support this protocol")
-	}
-	if serverVersion := rbuf[0]; serverVersion != client.version {
-		return fmt.Errorf("incompatible server version (client version: %v - server version: %v)",
-			client.version, serverVersion)
-	}
-	r2 := rbuf[1:33]
-	h1 := rbuf[33:65]
-	wh1 := auth1(conf, client.version, h0, r2)
-	if subtle.ConstantTimeCompare(wh1, h1) != 1 {
-		return errors.New("incorrect authentication code")
-	}
 	switch {
 	case isCopy:
 		return client.copyOperation(h1, in)
@@ -518,4 +483,60 @@ func runClientIO(conf Conf, isCopy bool, isMove bool, isPush bool, isPull bool, 
 	default:
 		return client.pasteOperation(h1, isMove, out)
 	}
+}
+
+// dialClient connects to the server and authenticates. It returns the
+// client, whose connection the caller must close, and h1.
+func dialClient(conf Conf, clientVersion byte) (*Client, []byte, error) {
+	conn, err := net.DialTimeout("tcp", conf.Connect, conf.Timeout)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to connect to %v - is a Piknik server running on that host?", conf.Connect)
+	}
+	client, h1, err := handshake(conf, conn, clientVersion)
+	if err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	return client, h1, nil
+}
+
+func handshake(conf Conf, conn net.Conn, clientVersion byte) (*Client, []byte, error) {
+	conn.SetDeadline(time.Now().Add(conf.Timeout))
+	reader, writer := bufio.NewReader(conn), bufio.NewWriter(conn)
+	client := &Client{
+		conf:    conf,
+		conn:    conn,
+		reader:  reader,
+		writer:  writer,
+		version: clientVersion,
+	}
+	r := make([]byte, 32)
+	if _, err := rand.Read(r); err != nil {
+		return nil, nil, err
+	}
+	h0 := auth0(conf, client.version, r)
+	writer.Write([]byte{client.version})
+	writer.Write(r)
+	writer.Write(h0)
+	if err := writer.Flush(); err != nil {
+		return nil, nil, err
+	}
+	rbuf := make([]byte, 65)
+	if nbread, err := io.ReadFull(reader, rbuf); err != nil {
+		if nbread < 2 {
+			return nil, nil, errors.New("the server rejected the connection - check that it is running the same Piknik version or retry later")
+		}
+		return nil, nil, errors.New("the server doesn't support this protocol")
+	}
+	if serverVersion := rbuf[0]; serverVersion != client.version {
+		return nil, nil, fmt.Errorf("incompatible server version (client version: %v - server version: %v)",
+			client.version, serverVersion)
+	}
+	r2 := rbuf[1:33]
+	h1 := rbuf[33:65]
+	wh1 := auth1(conf, client.version, h0, r2)
+	if subtle.ConstantTimeCompare(wh1, h1) != 1 {
+		return nil, nil, errors.New("incorrect authentication code")
+	}
+	return client, h1, nil
 }
