@@ -333,7 +333,13 @@ func newClipboard(syncImages bool) (clipboardAdapter, error) {
 		if _, err := exec.LookPath("xclip"); err != nil {
 			return nil, fmt.Errorf("no clipboard backend found: install wl-clipboard or xclip")
 		}
-		return &xclipClipboard{images: syncImages}, nil
+		c := &xclipClipboard{images: syncImages}
+		if _, err := exec.LookPath("clipnotify"); err == nil {
+			c.watchOneShot("clipnotify")
+		} else {
+			c.polling.Store(true)
+		}
+		return c, nil
 	}
 }
 
@@ -386,45 +392,84 @@ func runFeed(command string, data []byte, args ...string) error {
 	return cmd.Run()
 }
 
-// waylandClipboard uses wl-paste/wl-copy.
-type waylandClipboard struct {
-	images  bool
+// changeWatch tracks clipboard change notifications from a helper process.
+// Until a helper is running, or once none can run, every tick reads the
+// clipboard.
+type changeWatch struct {
 	dirty   atomic.Bool // a change notification arrived
 	polling atomic.Bool // change notifications are unavailable
 }
 
-// startWatch runs "wl-paste --watch", which prints a line on every clipboard
-// change. Compositors without a data-control protocol (GNOME, for one) do not
-// support it; the backend then reads the clipboard on every tick.
-func (c *waylandClipboard) startWatch() {
-	c.dirty.Store(true)
-	cmd := exec.Command("wl-paste", "--watch", "echo")
-	cmd.SysProcAttr = childProcAttr() // do not outlive piknik
-	out, err := cmd.StdoutPipe()
-	if err == nil {
-		err = cmd.Start()
-	}
-	if err != nil {
-		log.Printf("watch: wl-paste --watch unavailable (%v), polling instead", err)
-		c.polling.Store(true)
-		return
-	}
+func (w *changeWatch) Changed() bool {
+	return w.polling.Load() || w.dirty.Swap(false)
+}
+
+// watchLines runs a command that prints a line on every clipboard change,
+// such as "wl-paste --watch". It is restarted if it exits after having run
+// for a while, and abandoned for polling if it exits right away.
+func (w *changeWatch) watchLines(name string, args ...string) {
+	w.dirty.Store(true)
 	go func() {
-		buf := make([]byte, 512)
 		for {
-			if _, err := out.Read(buf); err != nil {
-				break
+			started := time.Now()
+			cmd := exec.Command(name, args...)
+			cmd.SysProcAttr = childProcAttr()
+			out, err := cmd.StdoutPipe()
+			if err == nil {
+				err = cmd.Start()
 			}
-			c.dirty.Store(true)
+			if err == nil {
+				buf := make([]byte, 512)
+				for {
+					if _, err := out.Read(buf); err != nil {
+						break
+					}
+					w.dirty.Store(true)
+				}
+				err = cmd.Wait()
+			}
+			if time.Since(started) < 5*time.Second {
+				log.Printf("watch: %s unavailable (%v), polling instead", name, err)
+				w.polling.Store(true)
+				return
+			}
+			log.Printf("watch: %s exited (%v), restarting", name, err)
+			w.dirty.Store(true)
+			time.Sleep(time.Second)
 		}
-		err := cmd.Wait()
-		log.Printf("watch: wl-paste --watch exited (%v), polling instead", err)
-		c.polling.Store(true)
 	}()
 }
 
-func (c *waylandClipboard) Changed() bool {
-	return c.polling.Load() || c.dirty.Swap(false)
+// watchOneShot runs a command that exits on the next clipboard change, such
+// as clipnotify, in a loop. A failure switches to polling.
+func (w *changeWatch) watchOneShot(name string, args ...string) {
+	w.dirty.Store(true)
+	go func() {
+		for {
+			cmd := exec.Command(name, args...)
+			cmd.SysProcAttr = childProcAttr()
+			if err := cmd.Run(); err != nil {
+				log.Printf("watch: %s failed (%v), polling instead", name, err)
+				w.polling.Store(true)
+				return
+			}
+			w.dirty.Store(true)
+		}
+	}()
+}
+
+// waylandClipboard uses wl-paste/wl-copy. Changes are watched with
+// "wl-paste --watch", which needs a data-control protocol; compositors
+// without one (GNOME, for one) fall back to polling.
+type waylandClipboard struct {
+	changeWatch
+	images bool
+}
+
+// startWatch runs wl-paste --watch. Where piknik cannot ask the kernel to
+// stop it on exit, the notifier kills wl-paste once nobody reads its output.
+func (c *waylandClipboard) startWatch() {
+	c.watchLines("wl-paste", "--watch", "sh", "-c", `trap '' PIPE; echo || kill $PPID`)
 }
 
 func (c *waylandClipboard) types() []string {
@@ -513,13 +558,13 @@ func (c *pbpasteClipboard) Set(item *clipItem) error {
 	return runFeed("pbcopy", item.data)
 }
 
-// xclipClipboard is the X11 backend. xclip cannot wait for changes, so the
-// clipboard is read on every tick.
+// xclipClipboard is the X11 backend. xclip cannot wait for changes: with
+// clipnotify installed the clipboard is read on change, otherwise on every
+// tick.
 type xclipClipboard struct {
+	changeWatch
 	images bool
 }
-
-func (c *xclipClipboard) Changed() bool { return true }
 
 func (c *xclipClipboard) targets() []string {
 	out, err := exec.Command("xclip", "-selection", "clipboard", "-t", "TARGETS", "-o").Output()

@@ -32,8 +32,11 @@ sponsored by the original author.
 - **Remote wins at startup** — starting the watcher never pushes whatever
   happens to be on the local clipboard; it picks up the server value instead.
 - **Password managers respected** — content marked as secret is never pushed:
-  `x-kde-passwordManagerHint` on Wayland/X11 (KeePassXC and others), and
-  `ExcludeClipboardContentFromMonitorProcessing` on Windows.
+  `x-kde-passwordManagerHint` on Wayland/X11 (KeePassXC and others); on
+  Windows `ExcludeClipboardContentFromMonitorProcessing`,
+  `Clipboard Viewer Ignore`, or `CanIncludeInClipboardHistory` /
+  `CanUploadToCloudClipboard` set to 0 (the markers that keep content out of
+  Win+V history and cloud clipboard).
 - **Text-only by default, binary firewall** — unless image sync is enabled, the
   watched clipboard is only read when it holds valid UTF-8 text, and remote
   content that is neither valid UTF-8 text nor a well-formed image envelope is
@@ -60,9 +63,12 @@ How `-watch` notices local changes:
 
 - Wayland: `wl-paste --watch`, so the clipboard is only read when it changes.
   This needs a compositor with a data-control protocol (KDE, wlroots-based
-  ones); elsewhere, GNOME included, it falls back to reading every tick.
+  ones); elsewhere, GNOME included, it falls back to reading every tick. If
+  `wl-paste --watch` dies after running for a while, it is restarted.
 - Windows: the clipboard sequence number; PowerShell only runs on a change.
-- X11 and macOS: the clipboard is read every tick.
+- X11: [`clipnotify`](https://github.com/cdown/clipnotify) if it is installed,
+  otherwise the clipboard is read every tick.
+- macOS: the clipboard is read every tick.
 
 The server is polled every `-watch-interval` after a change, backing off to
 four times the interval while nothing changes. Each poll downloads the full
